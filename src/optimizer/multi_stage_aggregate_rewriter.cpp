@@ -726,12 +726,13 @@ bool MultiStageAggregateRewriter::TryRewrite(unique_ptr<LogicalOperator> &op) {
 		}
 	}
 
-	bool rewrite_distinct_aggregates = rewrite_distinct;
-	if (rewrite_distinct_aggregates) {
-		rewrite_distinct_aggregates =
-		    CountDistinctAggregateSets(optimizer, aggr, MAX_DISTINCT_AGGREGATE_BRANCHES_TO_REWRITE) <=
+	bool too_many_distinct_branches = false;
+	if (rewrite_distinct) {
+		too_many_distinct_branches =
+		    CountDistinctAggregateSets(optimizer, aggr, MAX_DISTINCT_AGGREGATE_BRANCHES_TO_REWRITE) >
 		    MAX_DISTINCT_AGGREGATE_BRANCHES_TO_REWRITE;
 	}
+	const bool rewrite_distinct_aggregates = rewrite_distinct && !too_many_distinct_branches;
 
 	bool has_rewrite = false;
 	vector<bool> rewrite_candidates(aggr.expressions.size(), false);
@@ -741,9 +742,14 @@ bool MultiStageAggregateRewriter::TryRewrite(unique_ptr<LogicalOperator> &op) {
 			return false;
 		}
 		auto &aggregate = expr->Cast<BoundAggregateExpression>();
-		if (rewrite_distinct_aggregates && aggregate.IsDistinct()) {
-			has_rewrite = true;
-			continue;
+		if (aggregate.IsDistinct()) {
+			if (rewrite_distinct_aggregates) {
+				has_rewrite = true;
+				continue;
+			}
+			if (too_many_distinct_branches) {
+				continue;
+			}
 		}
 		if (ShouldRewrite(aggregate, aggr)) {
 			rewrite_candidates[aggregate_idx] = true;
@@ -762,6 +768,10 @@ bool MultiStageAggregateRewriter::TryRewrite(unique_ptr<LogicalOperator> &op) {
 	for (idx_t aggregate_idx = 0; aggregate_idx < aggr.expressions.size(); aggregate_idx++) {
 		auto &expr = aggr.expressions[aggregate_idx];
 		auto &aggregate = expr->Cast<BoundAggregateExpression>();
+		if (too_many_distinct_branches && aggregate.IsDistinct()) {
+			regular_aggregates.push_back(aggregate_idx);
+			continue;
+		}
 		if (rewrite_candidates[aggregate_idx]) {
 			AggregateRewriteInput rewrite_input(optimizer, aggr, aggregate);
 			auto rewrite = aggregate.Function().GetRewriteCallback()(rewrite_input);
