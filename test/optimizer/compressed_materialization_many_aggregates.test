@@ -1,5 +1,5 @@
 # name: test/optimizer/compressed_materialization_many_aggregates.test
-# description: Many DISTINCT aggregates over string columns (issue 26865 regression)
+# description: Many DISTINCT aggregates over string columns (issues 26865 and 27754)
 # group: [optimizer]
 
 statement ok
@@ -45,3 +45,22 @@ WHERE cd > 0 ORDER BY g DESC LIMIT 2;
 ----
 g3	17
 g2	17
+
+# A wide ungrouped DISTINCT aggregate should stay within the memory budget.
+statement ok
+SET memory_limit = '1GB';
+
+statement ok
+CREATE TABLE wide_distinct_memory AS
+PIVOT (
+    SELECT i, j, (i % 7)::VARCHAR AS value
+    FROM range(40) r(i), range(200) c(j)
+)
+ON j USING first(value)
+GROUP BY i;
+
+query IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+SELECT count(DISTINCT COLUMNS(* EXCLUDE (i)))
+FROM wide_distinct_memory;
+----
+7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7	7
