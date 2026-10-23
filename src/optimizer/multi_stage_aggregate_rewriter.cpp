@@ -592,11 +592,19 @@ static unique_ptr<LogicalOperator> JoinBranches(const vector<BranchResult> &bran
 	D_ASSERT(!branch_plans.empty());
 	if (groups.empty()) {
 		// Ungrouped aggregate branches each produce one row, including for empty inputs.
-		auto result = std::move(branch_plans[0]);
-		for (idx_t branch_idx = 1; branch_idx < branch_plans.size(); branch_idx++) {
-			result = LogicalCrossProduct::Create(std::move(result), std::move(branch_plans[branch_idx]));
-		}
-		return result;
+		// Ungrouped aggregate branches each produce one row, so they can be combined in any association.
+		// Keep the cross-product tree balanced to avoid repeatedly widening intermediate operators when
+		// a query contains many independent DISTINCT aggregates.
+		auto join_balanced = [&](auto &&self, idx_t begin, idx_t end) -> unique_ptr<LogicalOperator> {
+			if (end - begin == 1) {
+				return std::move(branch_plans[begin]);
+			}
+			auto mid = begin + (end - begin) / 2;
+			auto left = self(self, begin, mid);
+			auto right = self(self, mid, end);
+			return LogicalCrossProduct::Create(std::move(left), std::move(right));
+		};
+		return join_balanced(join_balanced, 0, branch_plans.size());
 	}
 
 	// Every branch consumes the same rows and retains every original group; null-safe inner joins preserve NULL keys.
