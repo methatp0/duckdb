@@ -728,9 +728,21 @@ bool MultiStageAggregateRewriter::TryRewrite(unique_ptr<LogicalOperator> &op) {
 
 	bool too_many_distinct_branches = false;
 	if (rewrite_distinct) {
-		too_many_distinct_branches =
-		    CountDistinctAggregateSets(optimizer, aggr, MAX_DISTINCT_AGGREGATE_BRANCHES_TO_REWRITE) >
-		    MAX_DISTINCT_AGGREGATE_BRANCHES_TO_REWRITE;
+		idx_t distinct_aggregate_count = 0;
+		for (auto &expr : aggr.expressions) {
+			if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE ||
+			    !expr->Cast<BoundAggregateExpression>().IsDistinct()) {
+				continue;
+			}
+			if (++distinct_aggregate_count > MAX_DISTINCT_AGGREGATE_BRANCHES_TO_REWRITE) {
+				// Only compare arguments and filters when there are enough DISTINCT aggregates
+				// for branch count to become a concern. Most queries take the cheap path here.
+				too_many_distinct_branches =
+				    CountDistinctAggregateSets(optimizer, aggr, MAX_DISTINCT_AGGREGATE_BRANCHES_TO_REWRITE) >
+				    MAX_DISTINCT_AGGREGATE_BRANCHES_TO_REWRITE;
+				break;
+			}
+		}
 	}
 	const bool rewrite_distinct_aggregates = rewrite_distinct && !too_many_distinct_branches;
 
