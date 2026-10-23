@@ -29,11 +29,8 @@ MultiStageAggregateRewriter::MultiStageAggregateRewriter(
 
 namespace {
 
-//
-// Keep DISTINCT rewrites bounded for very wide aggregate lists. Every independent
-// DISTINCT input becomes another branch over the same CTE, and the generated plan
-// can consume far more memory than the native aggregate for column-profiling queries.
-static constexpr idx_t MAX_DISTINCT_AGGREGATES_TO_REWRITE = 128;
+// Keep the logical DISTINCT rewrite from expanding into an excessive number of branches.
+static constexpr idx_t MAX_DISTINCT_AGGREGATE_BRANCHES_TO_REWRITE = 128;
 
 struct DistinctAggregateSet {
 	DistinctAggregateSet(idx_t source_index, vector<unique_ptr<Expression>> keys_p)
@@ -104,6 +101,47 @@ static void AddOrderExpressions(DistinctAggregateSet &set, const BoundAggregateE
 			set.order_expressions.push_back(order.expression->Copy());
 		}
 	}
+}
+
+static idx_t CountDistinctAggregateSets(Optimizer &optimizer, LogicalAggregate &aggr, idx_t stop_after) {
+	vector<DistinctAggregateSet> sets;
+	for (idx_t aggregate_idx = 0; aggregate_idx < aggr.expressions.size(); aggregate_idx++) {
+		auto &expr = aggr.expressions[aggregate_idx];
+		if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+			continue;
+		}
+		auto &aggregate = expr->Cast<BoundAggregateExpression>();
+		if (!aggregate.IsDistinct()) {
+			continue;
+		}
+
+		vector<unique_ptr<Expression>> keys;
+		for (auto &child : aggregate.GetChildren()) {
+			auto key = child->Copy();
+			if (aggregate.Function().GetCollationHandling() != FunctionCollationHandling::PUSH_DISTINCT_COLLATIONS) {
+				ExpressionBinder::PushCollation(optimizer.GetContext(), key, key->GetReturnType());
+			}
+			keys.push_back(std::move(key));
+		}
+
+		bool found_match = false;
+		for (auto &set : sets) {
+			auto &other = aggr.expressions[set.source_index]->Cast<BoundAggregateExpression>();
+			if (ArgumentsEqualIncludingCollation(aggregate, other) && Expression::ListEquals(keys, set.keys) &&
+			    Expression::Equals(aggregate.GetFilter(), other.GetFilter())) {
+				found_match = true;
+				break;
+			}
+		}
+		if (found_match) {
+			continue;
+		}
+		sets.emplace_back(aggregate_idx, std::move(keys));
+		if (sets.size() > stop_after) {
+			return sets.size();
+		}
+	}
+	return sets.size();
 }
 
 static unique_ptr<BoundAggregateExpression> CreateFinalAggregate(const BoundAggregateExpression &source,
@@ -690,15 +728,9 @@ bool MultiStageAggregateRewriter::TryRewrite(unique_ptr<LogicalOperator> &op) {
 
 	bool rewrite_distinct_aggregates = rewrite_distinct;
 	if (rewrite_distinct_aggregates) {
-		idx_t distinct_aggregate_count = 0;
-		for (auto &expr : aggr.expressions) {
-			if (expr->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE &&
-			    expr->Cast<BoundAggregateExpression>().IsDistinct() &&
-			    ++distinct_aggregate_count > MAX_DISTINCT_AGGREGATES_TO_REWRITE) {
-				rewrite_distinct_aggregates = false;
-				break;
-			}
-		}
+		rewrite_distinct_aggregates =
+		    CountDistinctAggregateSets(optimizer, aggr, MAX_DISTINCT_AGGREGATE_BRANCHES_TO_REWRITE) <=
+		    MAX_DISTINCT_AGGREGATE_BRANCHES_TO_REWRITE;
 	}
 
 	bool has_rewrite = false;
