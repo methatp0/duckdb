@@ -29,6 +29,12 @@ MultiStageAggregateRewriter::MultiStageAggregateRewriter(
 
 namespace {
 
+//
+// Keep DISTINCT rewrites bounded for very wide aggregate lists. Every independent
+// DISTINCT input becomes another branch over the same CTE, and the generated plan
+// can consume far more memory than the native aggregate for column-profiling queries.
+static constexpr idx_t MAX_DISTINCT_AGGREGATES_TO_REWRITE = 128;
+
 struct DistinctAggregateSet {
 	DistinctAggregateSet(idx_t source_index, vector<unique_ptr<Expression>> keys_p)
 	    : source_index(source_index), keys(std::move(keys_p)) {
@@ -592,19 +598,11 @@ static unique_ptr<LogicalOperator> JoinBranches(const vector<BranchResult> &bran
 	D_ASSERT(!branch_plans.empty());
 	if (groups.empty()) {
 		// Ungrouped aggregate branches each produce one row, including for empty inputs.
-		// Ungrouped aggregate branches each produce one row, so they can be combined in any association.
-		// Keep the cross-product tree balanced to avoid repeatedly widening intermediate operators when
-		// a query contains many independent DISTINCT aggregates.
-		auto join_balanced = [&](auto &&self, idx_t begin, idx_t end) -> unique_ptr<LogicalOperator> {
-			if (end - begin == 1) {
-				return std::move(branch_plans[begin]);
-			}
-			auto mid = begin + (end - begin) / 2;
-			auto left = self(self, begin, mid);
-			auto right = self(self, mid, end);
-			return LogicalCrossProduct::Create(std::move(left), std::move(right));
-		};
-		return join_balanced(join_balanced, 0, branch_plans.size());
+		auto result = std::move(branch_plans[0]);
+		for (idx_t branch_idx = 1; branch_idx < branch_plans.size(); branch_idx++) {
+			result = LogicalCrossProduct::Create(std::move(result), std::move(branch_plans[branch_idx]));
+		}
+		return result;
 	}
 
 	// Every branch consumes the same rows and retains every original group; null-safe inner joins preserve NULL keys.
@@ -690,6 +688,19 @@ bool MultiStageAggregateRewriter::TryRewrite(unique_ptr<LogicalOperator> &op) {
 		}
 	}
 
+	bool rewrite_distinct_aggregates = rewrite_distinct;
+	if (rewrite_distinct_aggregates) {
+		idx_t distinct_aggregate_count = 0;
+		for (auto &expr : aggr.expressions) {
+			if (expr->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE &&
+			    expr->Cast<BoundAggregateExpression>().IsDistinct() &&
+			    ++distinct_aggregate_count > MAX_DISTINCT_AGGREGATES_TO_REWRITE) {
+				rewrite_distinct_aggregates = false;
+				break;
+			}
+		}
+	}
+
 	bool has_rewrite = false;
 	vector<bool> rewrite_candidates(aggr.expressions.size(), false);
 	for (idx_t aggregate_idx = 0; aggregate_idx < aggr.expressions.size(); aggregate_idx++) {
@@ -698,7 +709,7 @@ bool MultiStageAggregateRewriter::TryRewrite(unique_ptr<LogicalOperator> &op) {
 			return false;
 		}
 		auto &aggregate = expr->Cast<BoundAggregateExpression>();
-		if (rewrite_distinct && aggregate.IsDistinct()) {
+		if (rewrite_distinct_aggregates && aggregate.IsDistinct()) {
 			has_rewrite = true;
 			continue;
 		}
@@ -737,7 +748,7 @@ bool MultiStageAggregateRewriter::TryRewrite(unique_ptr<LogicalOperator> &op) {
 			}
 			continue;
 		}
-		if (!rewrite_distinct || !aggregate.IsDistinct()) {
+		if (!rewrite_distinct_aggregates || !aggregate.IsDistinct()) {
 			regular_aggregates.push_back(aggregate_idx);
 			continue;
 		}
